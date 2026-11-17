@@ -25,5 +25,18 @@ El proyecto se gestiona con Poetry en modo sin paquete (`package-mode = false`).
 - No leas, abras ni muestres `.env` ni nada dentro de `data/`.
 - Antes de terminar un cambio, `poetry run pytest -q` y `poetry run ruff check .` deben pasar.
 
+## 5. Glosario
+- **Pedido** — solicitud de un cliente a la cafetería; agrupa uno o más ítems y tiene un estado.
+- **Ítem** — línea de un pedido: un producto del menú con su cantidad y precio unitario.
+- **Stock** — cantidad disponible de un producto; limita qué ítems se pueden pedir.
+- **Cliente** — persona que hace el pedido.
+- **Estado del pedido** — etapa en la que está el pedido. Valores posibles:
+  - `pendiente` — creado, aún sin pagar.
+  - `pagado` — pago registrado; listo para preparar y entregar.
+  - `entregado` — entregado al cliente. Estado final.
+  - `anulado` — cancelado antes de la entrega. Estado final.
+
+  Flujo: `pendiente` → `pagado` → `entregado`; `pendiente` o `pagado` → `anulado`.
+
 ## Pendiente
 Cuando existan, agregar aquí los comandos para levantar la API y la pantalla Streamlit.
