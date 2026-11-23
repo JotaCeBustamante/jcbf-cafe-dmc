@@ -42,4 +42,5 @@ CREATE TABLE IF NOT EXISTS detalle_pedido (
 
 CREATE INDEX IF NOT EXISTS idx_productos_categoria ON productos(categoria_id);
 CREATE INDEX IF NOT EXISTS idx_pedidos_cliente     ON pedidos(cliente_id);
+CREATE INDEX IF NOT EXISTS idx_pedidos_estado      ON pedidos(estado);
 CREATE INDEX IF NOT EXISTS idx_detalle_pedido      ON detalle_pedido(pedido_id);

@@ -2,9 +2,25 @@
 from fastapi import APIRouter, HTTPException
 
 from app.db import Conexion
-from app.modelos import Pedido, PedidoNuevo
+from app.modelos import CambioEstado, Pedido, PedidoNuevo
 
 router = APIRouter(prefix="/pedidos", tags=["pedidos"])
+
+# Flujo del estado del pedido (AGENTS.md, glosario). entregado y anulado son finales.
+TRANSICIONES = {
+    "pendiente": {"pagado", "anulado"},
+    "pagado": {"entregado", "anulado"},
+    "entregado": set(),
+    "anulado": set(),
+}
+
+
+def listar_por_cliente(con, cliente_id: int) -> list[dict]:
+    """Pedidos de un cliente, el más reciente primero. La usa el módulo de clientes."""
+    filas = con.execute(
+        "SELECT id, cliente_id, estado, total, fecha FROM pedidos"
+        " WHERE cliente_id = ? ORDER BY id DESC", (cliente_id,)).fetchall()
+    return [dict(f) for f in filas]
 
 
 @router.post("", response_model=Pedido, status_code=201)
@@ -44,3 +60,21 @@ def obtener_pedido(pedido_id: int, con: Conexion):
     if fila is None:
         raise HTTPException(status_code=404, detail="Pedido no encontrado")
     return dict(fila)
+
+
+@router.patch("/{pedido_id}/estado", response_model=Pedido)
+def cambiar_estado(pedido_id: int, cambio: CambioEstado, con: Conexion):
+    fila = con.execute("SELECT estado FROM pedidos WHERE id = ?", (pedido_id,)).fetchone()
+    if fila is None:
+        raise HTTPException(status_code=404, detail="Pedido no encontrado")
+    actual = fila["estado"]
+    if cambio.estado not in TRANSICIONES[actual]:
+        raise HTTPException(status_code=409,
+                            detail=f"No se puede pasar de '{actual}' a '{cambio.estado}'")
+    with con:
+        # El WHERE con el estado leído evita pisar un cambio hecho en paralelo
+        cur = con.execute("UPDATE pedidos SET estado = ? WHERE id = ? AND estado = ?",
+                          (cambio.estado, pedido_id, actual))
+    if cur.rowcount == 0:
+        raise HTTPException(status_code=409, detail="El pedido cambió de estado; vuelve a intentarlo")
+    return obtener_pedido(pedido_id, con)

@@ -34,3 +34,21 @@ with st.form("pedido"):
             st.success(f"Pedido #{r.json()['id']} creado. Total: S/ {r.json()['total']:.2f}")
         else:
             st.error(f"Error {r.status_code}: {r.json().get('detail')}")
+
+st.subheader("Mis pedidos")
+with st.form("mis_pedidos"):
+    mi_id = st.number_input("ID de cliente", min_value=1, value=1, key="mi_id")
+    if st.form_submit_button("Ver mis pedidos"):
+        r = httpx.get(f"{API}/clientes/{int(mi_id)}", timeout=5)
+        if r.status_code != 200:
+            st.error(f"Error {r.status_code}: {r.json().get('detail')}")
+        else:
+            st.write(f"Pedidos de **{r.json()['nombre']}**")
+            mis = httpx.get(f"{API}/clientes/{int(mi_id)}/pedidos", timeout=5).json()
+            if not mis:
+                st.info("Este cliente todavía no tiene pedidos.")
+            else:
+                st.dataframe(
+                    [{"Pedido": p["id"], "Fecha": p["fecha"], "Estado": p["estado"],
+                      "Total (S/)": f"{p['total']:.2f}"} for p in mis],
+                    width="stretch", hide_index=True)

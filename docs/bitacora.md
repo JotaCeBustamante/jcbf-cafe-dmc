@@ -330,3 +330,463 @@ menos una por endpoint.
   `repositorio.py`, y que el descuento de stock pase por `catalogo/servicio.py`.
 - **5:** usar `Decimal` (o céntimos enteros) para calcular el total.
 - **3:** se resuelve con autenticación, que está fuera del alcance actual.
+
+### Endpoint `GET /clientes/{cliente_id}` · 2026-11-22
+Le pedí al agente un endpoint que devuelva un cliente por su id, en un módulo nuevo
+`app/clientes.py`, con su prueba.
+
+**Qué se agregó:**
+- `app/clientes.py`: router `/clientes` (grupo "clientes" en Swagger) con
+  `GET /clientes/{cliente_id}`. Lee `SELECT id, nombre, email FROM clientes WHERE id = ?`, con
+  SQL parametrizado. Si el cliente no existe, responde **404** `{"detail": "Cliente no encontrado"}`.
+- `app/modelos.py`: esquema `Cliente` con `id`, `nombre` y `email`.
+- `app/main.py`: registra el router de `clientes`.
+
+![Swagger de GET /clientes/{cliente_id}](img/api-clientes.png)
+
+En Swagger aparece como "Obtener Cliente". Recibe `cliente_id` (entero, en la ruta) y
+responde `200` con `{"id": 0, "nombre": "string", "email": "string"}`, o `422` si el id no es
+un entero.
+
+**Pruebas** (en `tests/test_api.py`):
+
+| Prueba | Endpoint | Qué comprueba |
+|---|---|---|
+| `test_obtener_cliente` | `GET /clientes/1` | Responde 200 con `{"id": 1, "nombre": "Ana Torres", "email": "ana@ejemplo.com"}`. |
+| `test_cliente_inexistente` | `GET /clientes/999` | Responde 404 con `"Cliente no encontrado"`. |
+
+```text
+> poetry run pytest -q
+.........
+9 passed in 2.61s
+> poetry run ruff check .
+All checks passed!
+```
+
+**Observaciones:**
+- **Swagger no muestra el 404.** Solo lista `200` y `422`, porque el 404 sale de un
+  `HTTPException` y FastAPI no lo documenta por su cuenta. Para que aparezca en el contrato hay
+  que declararlo en el decorador con `responses={404: {...}}`. Lo mismo pasa con los 404 de
+  productos y pedidos.
+- **Choca con AGENTS.md §3 en dos puntos:**
+  - AGENTS.md pide una carpeta por módulo (`app/clientes/` con `router.py`, `schemas.py`,
+    `servicio.py` y `repositorio.py`). Seguí el estilo actual del código, que usa archivos
+    sueltos como `app/catalogo.py`.
+  - Según `db/schema.sql`, la tabla `clientes` es del contexto Pedidos, y `app/pedidos.py` ya
+    la consulta para validar el cliente. Ahora dos módulos hacen SQL sobre la misma tabla, y
+    la regla es un solo dueño por tabla. Pendiente: que Clientes sea el dueño y que Pedidos
+    valide el cliente a través de `clientes`, y registrarlo en un ADR.
+
+### Provocar un 201 en `POST /pedidos` · 2026-11-22
+Desde Swagger (`http://localhost:8000/docs`, "Crear Pedido" → "Try it out") envié un pedido
+válido: cliente 1 con 1 unidad del producto 1 (Espresso).
+
+![POST /pedidos responde 201](img/pedido-201.png)
+```text
+> curl -X POST http://localhost:8000/pedidos -H "Content-Type: application/json" \
+    -d '{"cliente_id": 1, "items": [{"producto_id": 1, "cantidad": 1}]}'
+201 Created
+{"id": 9, "cliente_id": 1, "estado": "pendiente", "total": 7}
+```
+
+Por qué responde 201 y no 200:
+- El endpoint se declara con `status_code=201` en `app/pedidos.py`, porque crea un recurso nuevo.
+- La petición pasa todas las validaciones: el cliente 1 existe, el producto 1 existe y está
+  activo, la cantidad está entre 1 y 20 y hay stock suficiente.
+
+Qué devuelve la respuesta:
+- `id` 9: es el pedido siguiente al #8 creado antes desde la pantalla Streamlit.
+- `estado` `pendiente`: todo pedido nuevo nace sin pagar.
+- `total` 7: 1 × 7.00, el precio actual del Espresso. Además, la API descontó 1 unidad de su stock.
+
+**Observaciones:**
+- **El total sale como `7` y no como `7.00`.** Es un `float` en JSON; la pantalla Streamlit lo
+  formatea a dos decimales, pero otro cliente de la API lo recibe sin ellos.
+- **La respuesta no trae la cabecera `Location`** (`/pedidos/9`). No es obligatoria, pero es lo
+  habitual en un 201 para indicar dónde consultar el recurso creado.
+- **No es reproducible tal cual.** Cada ejecución crea un pedido nuevo con otro `id` y descuenta
+  stock de la base `data/cafe.db`. Para volver a los datos iniciales:
+  `poetry run python scripts/crear_db.py --reset`.
+
+### Provocar un 404 en `POST /pedidos` · 2026-11-22
+Desde Swagger envié el mismo pedido que en el caso 201, pero con un producto que no existe:
+cliente 1 con 1 unidad del producto 99. Los datos de prueba solo tienen los productos 1 a 8.
+
+![POST /pedidos responde 404](img/pedido-404.png)
+```text
+> curl -X POST http://localhost:8000/pedidos -H "Content-Type: application/json" \
+    -d '{"cliente_id": 1, "items": [{"producto_id": 99, "cantidad": 1}]}'
+404 Not Found
+{"detail": "Producto 99 no existe"}
+```
+
+Por qué responde 404:
+- En `app/pedidos.py`, el endpoint busca cada producto con
+  `SELECT id, precio, stock FROM productos WHERE id = ? AND activo = 1`. Si no encuentra la fila,
+  lanza `HTTPException(status_code=404, detail=f"Producto {item.producto_id} no existe")`.
+- La validación ocurre **antes** de abrir la transacción, así que no se creó ningún pedido ni
+  se descontó stock.
+- Un producto inactivo (`activo = 0`) daría la misma respuesta, aunque exista en la tabla.
+
+El mismo endpoint también responde 404 si el cliente no existe (`"Cliente no encontrado"`).
+
+**Observaciones:**
+- **Swagger marca el 404 como "Undocumented".** El contrato OpenAPI de `POST /pedidos` solo
+  declara `201` y `422`. Es el mismo problema anotado en `GET /clientes/{cliente_id}`: el 404
+  sale de un `HTTPException` y hay que declararlo con `responses={404: {...}}` en el decorador.
+  Tampoco está declarado el 409 por falta de stock.
+- **Ninguna prueba cubre este 404.** `tests/test_api.py` prueba el 404 de `GET /productos/{id}`,
+  pero no el de `POST /pedidos` con un producto o un cliente que no existen. Pendiente: agregar
+  esas dos pruebas.
+- **Discutible: 404 o 422.** La ruta `/pedidos` sí existe; lo que falta es un producto
+  mencionado en el cuerpo. Algunas APIs responden 422 (o 409) en ese caso y reservan el 404
+  para cuando no existe el recurso de la URL. CaféDMC usa 404; conviene dejarlo escrito para
+  que todos los endpoints sigan el mismo criterio.
+
+### Provocar un 409 en `POST /pedidos` · 2026-11-22
+Desde Swagger pedí más unidades de las que había en stock: cliente 1 con 20 unidades del
+producto 1 (Espresso). 20 es la cantidad máxima que acepta `ItemPedido`, así que la petición
+pasa la validación de entrada y llega a la revisión de stock.
+
+![POST /pedidos responde 409](img/pedido-409.png)
+```text
+> curl -X POST http://localhost:8000/pedidos -H "Content-Type: application/json" \
+    -d '{"cliente_id": 1, "items": [{"producto_id": 1, "cantidad": 20}]}'
+409 Conflict
+{"detail": "Stock insuficiente para producto 1"}
+```
+
+Por qué responde 409:
+- En `app/pedidos.py`, el endpoint compara `prod["stock"] < item.cantidad`. Si no alcanza, lanza
+  `HTTPException(status_code=409, detail=f"Stock insuficiente para producto {item.producto_id}")`.
+- En ese momento el stock del Espresso era menor que 20 (en los datos de prueba parte de 100).
+  La captura de "Mis pedidos" (más abajo) muestra por qué: justo antes se crearon los pedidos
+  #10 a #13, de S/ 140.00 cada uno. El stock actual se consulta con `GET /productos/1`.
+- Igual que en el 404, la revisión ocurre **antes** de la transacción: no se creó el pedido ni
+  se descontó stock.
+
+Cómo se diferencia de los otros errores del mismo endpoint:
+
+| Código | Cuándo | Ejemplo |
+|---|---|---|
+| 422 | El cuerpo no cumple el esquema | `cantidad` 21 (máximo 20) o 0 |
+| 404 | El cliente o un producto no existe o está inactivo | `producto_id` 99 |
+| 409 | La petición es válida, pero choca con el estado actual de los datos | 20 unidades con menos de 20 en stock |
+
+**Observaciones:**
+- **Swagger marca el 409 como "Undocumented",** igual que el 404. El contrato OpenAPI de
+  `POST /pedidos` solo declara `201` y `422`.
+- **Este 409 sí tiene prueba:** `test_stock_insuficiente` crea un pedido de 15 tortas (stock 20)
+  y comprueba que un segundo pedido de 15 responde 409.
+- **El 409 depende de los datos.** Con la base recién creada (Espresso con 100) la misma
+  petición responde 201. Para reproducirlo tal cual hay que bajar antes el stock, o pedir un
+  producto con poco stock, como la torta de chocolate (20 unidades).
+- **Riesgos ya anotados en la revisión de `app/pedidos.py`:** un pedido con el mismo producto
+  repetido en dos líneas, o dos pedidos simultáneos, se saltan esta revisión y terminan en un
+  **500** en vez de un 409.
+
+### Provocar un 422 en `POST /pedidos` · 2026-11-22
+Desde Swagger envié un pedido con cantidad 0: cliente 1 con 0 unidades del producto 1.
+`ItemPedido` exige `cantidad` entre 1 y 20 (`Field(gt=0, le=20)` en `app/modelos.py`).
+
+```text
+> curl -X POST http://localhost:8000/pedidos -H "Content-Type: application/json" \
+    -d '{"cliente_id": 1, "items": [{"producto_id": 1, "cantidad": 0}]}'
+422 Unprocessable Content
+{
+  "detail": [
+    {
+      "type": "greater_than",
+      "loc": ["body", "items", 0, "cantidad"],
+      "msg": "Input should be greater than 0",
+      "input": 0,
+      "ctx": {"gt": 0}
+    }
+  ]
+}
+```
+En Swagger se ve el comienzo de este cuerpo. El cuerpo completo lo saqué reproduciendo la
+misma petición con `TestClient` sobre una base temporal, que también respondió 422.
+
+Cómo leer la respuesta:
+- `loc` dice dónde está el error: en el cuerpo (`body`), en el primer ítem (`items`, posición
+  `0`), campo `cantidad`.
+- `type` y `ctx` dicen qué regla falló: "mayor que 0" (`gt: 0`).
+- `input` es el valor recibido: `0`.
+- `detail` es una lista: si hubiera varios campos inválidos, vendría un error por cada uno.
+
+**Observaciones:**
+- **El 422 sí está documentado en Swagger,** a diferencia del 404 y el 409: FastAPI lo agrega
+  solo a todo endpoint que recibe parámetros o cuerpo.
+- **El mensaje está en inglés** ("Input should be greater than 0") y tiene otra forma
+  (`detail` es una lista de objetos). Los errores de `app/pedidos.py` están en español y
+  `detail` es un texto. Quien consuma la API tiene que manejar los dos formatos.
+- **Tiene prueba:** `test_cantidad_maxima` comprueba el límite superior (21 → 422). El límite
+  inferior (0) no tiene prueba propia.
+
+### Qué capa respondió cada código
+Una petición a la API pasa por tres capas, en este orden:
+1. **FastAPI/Pydantic**: lee la ruta y el cuerpo y los valida contra los modelos de
+   `app/modelos.py`. Si algo no cumple, responde sin llamar a mi función.
+2. **Mi código** (`app/pedidos.py`, `app/clientes.py`): aplica las reglas de negocio,
+   consulta la base y decide el código de respuesta.
+3. **La base SQLite** (`db/schema.sql`): guarda y devuelve filas, y rechaza lo que viola sus
+   restricciones (`CHECK`, `UNIQUE`, claves foráneas).
+
+| Caso | Código | Capa que respondió | Por qué |
+|---|---|---|---|
+| Cantidad 0 | 422 | **FastAPI/Pydantic** | `Field(gt=0)` falla al leer el cuerpo. Mi función no llega a ejecutarse y no se hace ninguna consulta SQL. Yo escribí la regla en el modelo, pero quien la aplica y arma la respuesta es FastAPI. |
+| Producto 99 | 404 | **Mi código** | La base solo devuelve "ninguna fila" para el `SELECT`; no es un error para SQLite. Mi código interpreta esa ausencia y lanza `HTTPException(404)`. |
+| 20 Espressos sin stock | 409 | **Mi código** | La comparación `prod["stock"] < item.cantidad` está en `app/pedidos.py`. El `CHECK (stock >= 0)` de la base no llega a actuar, porque el pedido se rechaza antes del `UPDATE`. |
+| Pedido válido | 201 | **Mi código**, con ayuda de las otras dos | FastAPI valida la entrada; mi código calcula el total y ejecuta los `INSERT` y el `UPDATE` en una transacción; la base los guarda. El `201` viene de `status_code=201` en el decorador, y FastAPI valida la respuesta con `response_model=Pedido`. |
+| `GET /clientes/999` | 404 | **Mi código** | Igual que el producto 99: el `SELECT` no devuelve fila y `app/clientes.py` lanza el 404. |
+| `GET /clientes/abc` | 422 | **FastAPI/Pydantic** | `cliente_id: int` no acepta texto; mi función no se ejecuta. |
+
+**La base no respondió directamente en ninguno de estos casos.** Solo respondería si se viola
+una de sus restricciones, y entonces la API no la traduce: el `sqlite3.IntegrityError` no se
+captura y el cliente recibe un **500**. Es lo que pasaría en los dos riesgos anotados en la
+revisión de `app/pedidos.py`, un producto repetido en el pedido o dos pedidos simultáneos,
+cuando el `UPDATE` deja el stock negativo y choca con el `CHECK (stock >= 0)`.
+
+Cómo se distinguen las capas en la respuesta:
+- **FastAPI/Pydantic:** `detail` es una lista con `type`, `loc` y `msg`, en inglés.
+- **Mi código:** `detail` es un texto en español ("Producto 99 no existe").
+- **La base:** un 500 con `Internal Server Error`, sin detalle.
+
+### Endpoint `PATCH /pedidos/{pedido_id}/estado` · 2026-11-22
+Le pedí al agente un endpoint para cambiar el estado de un pedido que solo permita las
+transiciones del glosario de AGENTS.md y responda 409 a cualquier otra. Le pedí escribir
+**primero las pruebas**.
+
+![Swagger de PATCH /pedidos/{pedido_id}/estado](img/pedido-patch-estado.png)
+
+En Swagger aparece como "Cambiar Estado". Recibe `pedido_id` (entero, en la ruta) y un cuerpo
+`{"estado": "..."}`, y responde con el pedido actualizado (`id`, `cliente_id`, `estado`, `total`).
+
+**Reglas:**
+
+| Desde \ hacia | pendiente | pagado | entregado | anulado |
+|---|---|---|---|---|
+| **pendiente** | 409 | ✅ 200 | 409 | ✅ 200 |
+| **pagado** | 409 | 409 | ✅ 200 | ✅ 200 |
+| **entregado** (final) | 409 | 409 | 409 | 409 |
+| **anulado** (final) | 409 | 409 | 409 | 409 |
+
+| Caso | Código | Capa que responde |
+|---|---|---|
+| Transición permitida | 200 | Mi código |
+| Transición no permitida, incluido el mismo estado | 409 `"No se puede pasar de 'X' a 'Y'"` | Mi código |
+| El pedido no existe | 404 `"Pedido no encontrado"` | Mi código |
+| Estado desconocido, como `"cocinando"` | 422 | FastAPI/Pydantic (`Literal` de los 4 estados) |
+
+**Primero las pruebas.** Se agregaron 14 pruebas a `tests/test_api.py`. Cada una crea su
+propio pedido con `POST /pedidos`, así no dependen de los pedidos de los datos de prueba.
+- `test_transiciones_permitidas` (4 casos): los cuatro caminos válidos. Además comprueba con
+  `GET /pedidos/{id}` que el cambio quedó guardado.
+- `test_transiciones_prohibidas` (8 casos): saltarse el pago, volver atrás, repetir el mismo
+  estado y salir de `entregado` o `anulado`. Además comprueba que el estado no cambió.
+- `test_cambiar_estado_pedido_inexistente` (404) y `test_cambiar_estado_valor_desconocido` (422).
+
+Al correrlas antes de escribir el endpoint:
+```text
+> poetry run pytest -q
+13 failed, 10 passed
+```
+Los 10 que pasaron son las 9 pruebas anteriores y la del 404. Esa pasó por la razón
+equivocada: la ruta aún no existía y FastAPI respondía 404 por su cuenta. Con el endpoint
+escrito, el 404 lo da mi código y la prueba sigue siendo válida.
+
+Después de escribir el endpoint:
+```text
+> poetry run pytest -q
+.......................
+23 passed
+> poetry run ruff check .
+All checks passed!
+```
+
+**Qué se cambió en el código:**
+- `app/modelos.py`: el tipo `EstadoPedido` (`Literal` con los 4 estados) y el modelo
+  `CambioEstado`.
+- `app/pedidos.py`: la tabla `TRANSICIONES` con el flujo del glosario y el endpoint. El
+  `UPDATE` lleva `WHERE id = ? AND estado = ?` con el estado que se leyó antes. Si otro cambio
+  llegó en paralelo, no se actualiza ninguna fila y la API responde 409 en lugar de pisarlo.
+
+**Observaciones de la captura:**
+- **El ejemplo de Swagger es `"pendiente"`,** el primer valor del `Literal`. Es justo un valor
+  que siempre da 409, porque ningún estado puede volver a `pendiente`. Conviene poner un
+  ejemplo útil, como `"pagado"`.
+- **La respuesta muestra `"estado": "string"`.** `Pedido.estado` es `str` y no `EstadoPedido`,
+  así que el contrato no dice qué valores puede traer.
+- **Solo se documentan 200 y 422.** El 404 y el 409 no aparecen, igual que en los otros endpoints.
+
+**Pendientes:**
+- **Anular no devuelve el stock.** Un pedido anulado deja descontadas sus unidades. Falta
+  decidir si debe devolverlas.
+- **La regla está en el router.** AGENTS.md pide ponerla en `servicio.py`, pero esa capa aún
+  no existe; se siguió el estilo de `POST /pedidos`.
+
+### Endpoint `GET /clientes/{cliente_id}/pedidos` y sección "Mis pedidos" · 2026-11-22
+Le pedí al agente un endpoint con los pedidos de un cliente y una sección "Mis pedidos" en la
+pantalla Streamlit que pida el ID de cliente y los muestre.
+
+**El endpoint.** Devuelve los pedidos del cliente, del más reciente al más antiguo, con `id`,
+`cliente_id`, `estado`, `total` y `fecha`:
+
+| Caso | Código | Capa que responde |
+|---|---|---|
+| El cliente existe | 200 con la lista | Mi código |
+| El cliente existe y no tiene pedidos | 200 con `[]` | Mi código |
+| El cliente no existe | 404 `"Cliente no encontrado"` | Mi código |
+| El id no es un entero | 422 | FastAPI/Pydantic |
+
+![Swagger de GET /clientes/{cliente_id}/pedidos](img/api-clientes-pedidos.png)
+
+En Swagger aparece en el grupo "clientes" como "Pedidos Del Cliente". Recibe `cliente_id`
+(entero, en la ruta) y responde `200` con una lista de
+`{"id", "cliente_id", "estado", "total", "fecha"}`, o `422` si el id no es un entero.
+
+Qué no muestra el contrato:
+- **El 404** cuando el cliente no existe, igual que en los otros endpoints.
+- **Los valores posibles de `estado`:** aparece como `"string"` porque `Pedido.estado` es `str`
+  y no `EstadoPedido`. Es el mismo problema anotado en el PATCH de estado.
+- **El formato de `fecha`:** aparece como `"string"`, sin decir que es UTC con la forma
+  `AAAA-MM-DD HH:MM:SS`.
+- **El nombre "Pedidos Del Cliente"** lo arma FastAPI a partir del nombre de la función
+  (`pedidos_del_cliente`), con mayúscula en cada palabra. Se puede cambiar con `summary=` en el
+  decorador.
+
+Cómo respeta el dueño de cada tabla (AGENTS.md §3): la ruta está en `app/clientes.py`, pero el
+SQL sobre `pedidos` está en `listar_por_cliente()`, dentro de `app/pedidos.py`. `clientes.py`
+solo comprueba que el cliente exista en su tabla y llama a esa función. Se agregó el modelo
+`PedidoDeCliente` (`Pedido` más `fecha`) para no cambiar la respuesta de los demás endpoints.
+
+**Primero las pruebas.** 5 pruebas nuevas en `tests/test_api.py`; antes del endpoint fallaban
+las 5:
+```text
+> poetry run pytest -q
+5 failed, 23 passed
+```
+
+| Prueba | Qué comprueba |
+|---|---|
+| `test_pedidos_de_cliente` | Ana (cliente 1) tiene los pedidos `[4, 1]` de los datos de prueba, en ese orden, con los 5 campos. |
+| `test_pedidos_de_cliente_incluye_nuevo_y_su_estado` | Un pedido recién creado y pagado aparece primero y con estado `pagado`. |
+| `test_pedidos_de_cliente_no_mezcla_clientes` | Luis (cliente 2) solo ve su pedido `[2]`. |
+| `test_pedidos_de_cliente_sin_pedidos` | Un cliente sin pedidos recibe `200 []`. Como todos los clientes de prueba tienen pedidos, la prueba inserta uno nuevo en la base temporal. |
+| `test_pedidos_de_cliente_inexistente` | El cliente 999 recibe 404. |
+
+Después del endpoint:
+```text
+> poetry run pytest -q
+28 passed
+> poetry run ruff check .
+All checks passed!
+```
+
+**La pantalla.** `ui/streamlit_app.py` tiene una sección "Mis pedidos" debajo de "Nuevo
+pedido": un campo "ID de cliente" y el botón "Ver mis pedidos". Llama a dos endpoints por HTTP:
+- `GET /clientes/{id}` para mostrar "Pedidos de **nombre**". Si responde 404, muestra el error.
+- `GET /clientes/{id}/pedidos` para la tabla: pedido, fecha, estado y total en soles con dos
+  decimales. Si la lista está vacía, muestra "Este cliente todavía no tiene pedidos."
+
+![Mis pedidos de Ana Torres](img/mis-pedidos.png)
+
+Qué muestra la captura, con la base de desarrollo `data/cafe.db`:
+- **Pedido #4** (`entregado`, S/ 21.00) es de los datos de prueba: 3 Espressos. El #1 queda más
+  abajo en la tabla.
+- **Pedidos #5 a #9** (S/ 7.00, `pendiente`) son de 1 Espresso cada uno, creados desde la
+  pantalla y desde Swagger. El #9, a las 04:15:17, es el del caso 201: la cabecera `date` de
+  esa respuesta decía 04:15:16 GMT.
+- **Pedidos #10 a #13** (S/ 140.00, `pendiente`) se crearon en 3 segundos, de 04:17:31 a
+  04:17:34. 140.00 corresponde a 20 Espressos a S/ 7.00, la cantidad máxima. Si fueron
+  Espressos, el stock bajó a 100 − 5 − 80 = **15**, y eso explica el 409 al pedir otros 20.
+  Esto lo deduzco por los montos; no lo comprobé en la base.
+
+**Observaciones:**
+- **Nada impide crear el mismo pedido varias veces.** Cuatro pedidos iguales en 3 segundos
+  parecen clics repetidos en "Execute". La API no tiene forma de detectar un envío duplicado
+  (por ejemplo, una clave de idempotencia).
+- **La fecha está en UTC y sin formato** (`2026-11-23 04:17:34`). En Lima son 5 horas menos:
+  esos pedidos se hicieron el 22 de noviembre a las 23:17.
+- **Todos los pedidos visibles siguen `pendiente`.** "Mis pedidos" todavía no permite pagar ni
+  anular; para eso hay que usar `PATCH /pedidos/{id}/estado` desde Swagger.
+- **La pantalla no tiene prueba automática.** Intenté ejecutarla con `AppTest` de Streamlit
+  contra una API temporal, pero el sistema de permisos bloqueó el comando porque al final
+  cerraba todos los procesos `uvicorn`. La comprobé a mano: esta captura.
+
+### Planes de consulta e índice por estado · 2026-11-22
+Le pedí al agente analizar con `sqlite3` de Python el plan de dos consultas, decir cuál
+recorre toda la tabla, agregar el índice que falta y verificar el cambio.
+
+**Cómo se analizó.** Con `EXPLAIN QUERY PLAN` sobre una base temporal creada desde
+`db/schema.sql` con `crear_db.crear()`, sin tocar `data/cafe.db`. SQLite responde con una de
+dos palabras por tabla:
+- `SCAN`: recorre todas las filas de la tabla.
+- `SEARCH … USING INDEX`: salta directo a las filas que cumplen la condición usando un índice.
+
+Las consultas:
+- **(a) Productos de una categoría**, la de `GET /productos?categoria=` en `app/catalogo.py`:
+  `… FROM productos p JOIN categorias c ON c.id = p.categoria_id WHERE p.activo = 1 AND c.nombre = ?`
+- **(b) Pedidos por estado:** `SELECT id, cliente_id, estado, total FROM pedidos WHERE estado = ?`
+
+**Antes del cambio:**
+```text
+(a) productos de una categoría
+    SEARCH c USING COVERING INDEX sqlite_autoindex_categorias_1 (nombre=?)
+    SEARCH p USING INDEX idx_productos_categoria (categoria_id=?)
+(b) pedidos por estado
+    SCAN pedidos
+```
+- **(a) ya usaba índices.** Busca la categoría por `sqlite_autoindex_categorias_1`, el índice
+  que SQLite crea solo para `nombre UNIQUE`. Es "covering" porque el índice ya trae el `id` que
+  necesita, sin leer la tabla. Después busca los productos por `idx_productos_categoria`.
+- **(b) recorría toda la tabla.** `pedidos` solo tenía índice por `cliente_id`; para filtrar por
+  `estado`, SQLite tenía que leer cada pedido.
+
+Esto confirma lo anotado al comparar mi esquema con el del curso: "el curso no tiene índice
+por estado".
+
+**El cambio** en `db/schema.sql`, junto a los demás índices:
+```sql
+CREATE INDEX IF NOT EXISTS idx_pedidos_estado      ON pedidos(estado);
+```
+
+**Después del cambio:**
+```text
+(b) pedidos por estado
+    SEARCH pedidos USING INDEX idx_pedidos_estado (estado=?)
+```
+El plan de (a) no cambió.
+
+**Verificación con pruebas.** Primero se agregaron dos pruebas a `tests/test_api.py` que leen
+el plan con `EXPLAIN QUERY PLAN` y exigen el índice correcto y que no aparezca `SCAN`:
+
+| Prueba | Exige |
+|---|---|
+| `test_productos_por_categoria_usa_indice` | `idx_productos_categoria` en el plan de (a) |
+| `test_pedidos_por_estado_usa_indice` | `idx_pedidos_estado` en el plan de (b) |
+
+```text
+> poetry run pytest -q          # antes de agregar el índice
+1 failed, 29 passed             # falla test_pedidos_por_estado_usa_indice
+> poetry run pytest -q          # después
+30 passed
+> poetry run ruff check .
+All checks passed!
+```
+Estas pruebas también sirven a futuro: si una migración borra o renombra un índice, fallan.
+
+**Observaciones:**
+- **`data/cafe.db` todavía no tiene el índice.** El esquema solo se aplica al crear la base.
+  Para agregarlo sin perder datos: `poetry run python scripts/crear_db.py`, sin `--reset`. El
+  script vuelve a ejecutar `db/schema.sql` sobre la base existente, y `IF NOT EXISTS` solo crea
+  lo que falta.
+- **Ningún endpoint filtra todavía por estado.** El índice deja lista la consulta que necesitará
+  una lista del cajero, por ejemplo "pedidos pagados por entregar".
+- **Si esa lista se ordena por fecha, conviene un índice compuesto `pedidos(estado, fecha)`.**
+  Con `(estado)` solo, SQLite filtra con el índice pero ordena aparte; con `(estado, fecha)`
+  hace las dos cosas con el mismo índice.
+- **Con tablas tan pequeñas no se nota en el tiempo.** Con 13 pedidos un `SCAN` es instantáneo.
+  Lo que importa es el plan: con el índice, el costo de la consulta ya no crece con el total de
+  pedidos, sino con los que tienen ese estado.
