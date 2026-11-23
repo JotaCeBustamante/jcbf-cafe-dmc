@@ -109,3 +109,136 @@ ruff check...............................................................Failed
 F401 [*] `os` imported but unused
 Found 1 error.
 ```
+
+## Modelo de datos · 2026-11-22
+
+### Esquema propuesto por el agente vs. esquema del curso
+El agente propuso un esquema a partir de las cuatro historias de usuario. Quedó en el commit
+`faf83cd` (`git show faf83cd:db/schema.sql`). Después lo reemplacé en `db/schema.sql` por el
+esquema del curso. Las dos versiones tienen las mismas 5 entidades, las mismas claves foráneas,
+los mismos estados del pedido y el borrado en cascada de los ítems. Difieren en lo siguiente:
+
+**Nombres y estructura**
+| Aspecto | Agente (`faf83cd`) | Curso | Comentario |
+|---|---|---|---|
+| Nombres de tabla | Singular: `categoria`, `producto`, `cliente`, `pedido`, `pedido_item` | Plural: `categorias`, `productos`, `clientes`, `pedidos`, `detalle_pedido` | Es solo convención; el código debe usar los del curso. |
+| Clave primaria | `INTEGER PRIMARY KEY` | `INTEGER PRIMARY KEY AUTOINCREMENT` | `AUTOINCREMENT` nunca reutiliza el id de una fila borrada, a cambio de un poco más de trabajo para SQLite. |
+| Clave de los ítems | Compuesta `(pedido_id, producto_id)` | `id` propio, sin `UNIQUE` | En el curso, un producto puede repetirse en el mismo pedido. |
+| Tablas `STRICT` | Sí | No | Sin `STRICT`, SQLite guarda un texto en una columna numérica. |
+| Fecha del pedido | `creado_en`, ISO-8601 UTC (`2026-11-23T02:46:46Z`) | `fecha`, `datetime('now')` (`2026-11-23 02:46:46`) | Ambas son UTC; la del curso no lo indica en el texto. |
+
+**Dinero y total**
+| Aspecto | Agente | Curso | Comentario |
+|---|---|---|---|
+| Tipo del dinero | `INTEGER` en céntimos | `REAL` | Con `REAL`, `0.1 + 0.2` da `0.30000000000000004`. |
+| Total del pedido | No se guarda; se calcula sumando los ítems | `pedidos.total REAL NOT NULL DEFAULT 0` | El curso lo lee más rápido, pero el servicio debe mantenerlo sincronizado con los ítems: si un pedido se crea sin calcularlo, queda en 0. |
+| Precio unitario | `CHECK (> 0)` | Sin `CHECK` | El curso acepta un precio unitario negativo. |
+
+**Restricciones**
+| Aspecto | Agente | Curso | Comentario |
+|---|---|---|---|
+| Email del cliente | Opcional, `UNIQUE COLLATE NOCASE` | `NOT NULL UNIQUE`, distingue mayúsculas | En el curso el email es obligatorio, pero `a@x.pe` y `A@X.PE` cuentan como dos clientes distintos. |
+| Nombres repetidos | `COLLATE NOCASE` en categoría y producto | Distingue mayúsculas | En el curso pueden convivir "Bebidas" y "bebidas". |
+| Nombres vacíos | `CHECK (length(trim(...)) > 0)` | Sin `CHECK` | El curso acepta `''` como nombre. |
+| Borrado de padres | `ON DELETE RESTRICT` explícito | Por defecto (`NO ACTION`) | En la práctica se comportan igual con `foreign_keys = ON`. |
+
+**Índices**
+| Agente | Curso | Comentario |
+|---|---|---|
+| `producto(categoria_id, nombre)` | `productos(categoria_id)` | El del agente además devuelve los productos ordenados por nombre. |
+| `pedido(cliente_id, creado_en)` | `pedidos(cliente_id)` | El del agente además ordena el historial del cliente por fecha. |
+| `pedido(estado, creado_en)` | — | El curso no tiene índice por estado (lista del cajero, ventas pagadas o entregadas). |
+| `pedido_item(producto_id)` | — | El curso no indexa por producto, que es lo que necesita el reporte de más vendidos. |
+| Cubierto por la clave compuesta | `detalle_pedido(pedido_id)` | Es el mismo acceso, ítems de un pedido, resuelto de dos formas. |
+
+**Comprobación del esquema del curso.** Lo cargué en una base en memoria. Aceptó, sin dar error:
+- el mismo producto dos veces en un pedido;
+- un `precio_unitario` de `-5`;
+- el email `A@X.PE` cuando ya existía `a@x.pe`;
+- `precio = 'abc'`. El `CHECK (precio > 0)` no lo detiene porque en SQLite cualquier texto
+  se considera mayor que cualquier número.
+
+**Qué implica para el código.** El esquema del curso deja varias reglas al servicio:
+- `pedidos/servicio.py` debe juntar los productos repetidos en una sola línea, rechazar precios
+  y cantidades inválidos y recalcular `total` en la misma transacción que crea o modifica el pedido.
+- Conviene manejar el dinero con `Decimal` en Python y redondear a 2 decimales antes de guardarlo.
+
+### Creación de la base con el esquema del curso
+`scripts/crear_db.py` crea `data/cafe.db` a partir de `db/schema.sql` y la llena con datos de
+prueba. Si la base ya existe, no la vuelve a llenar; con `--reset` la borra y la crea de nuevo.
+`data/*.db` está en `.gitignore`, así que la base no se sube al repositorio.
+
+![Creación de la base](img/modelo-crear-db.png)
+```text
+> poetry run python scripts/crear_db.py
+categorias        3 filas
+productos         8 filas
+clientes          3 filas
+pedidos           4 filas
+detalle_pedido    6 filas
+✅ Base lista en C:\Users\JoseBustamante\jcbf-cafe-dmc\data\cafe.db
+```
+Los conteos coinciden con los datos del script:
+- 3 categorías: Café, Bebidas frías y Pastelería.
+- 8 productos.
+- 3 clientes.
+- 4 pedidos: 2 `entregado`, 1 `pagado` y 1 `pendiente`.
+- 6 ítems entre los cuatro pedidos.
+
+El script calcula y guarda el `total` de cada pedido al insertarlo, porque el esquema del curso
+lo deja en 0 si nadie lo calcula.
+
+### Levantar la API
+`app/main.py` crea la aplicación FastAPI (`CaféDMC API`, versión 0.1.0) y registra los routers de
+`catalogo` y `pedidos`. Se levanta con el servidor `uvicorn`, que viene incluido en
+`fastapi[standard]`:
+```text
+> poetry run uvicorn app.main:app --reload
+INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
+```
+La documentación interactiva (Swagger) queda en `http://localhost:8000/docs`, y el contrato
+OpenAPI 3.1 en `/openapi.json`.
+
+![Swagger de la API](img/api-docs.png)
+
+| Grupo | Método y ruta | Operación |
+|---|---|---|
+| catálogo | `GET /productos` | Listar productos |
+| catálogo | `GET /productos/{producto_id}` | Obtener un producto |
+| pedidos | `POST /pedidos` | Crear un pedido |
+| pedidos | `GET /pedidos/{pedido_id}` | Obtener un pedido |
+| sistema | `GET /salud` | Comprobar que la API responde |
+
+Esquemas: `ItemPedido`, `Pedido`, `PedidoNuevo`, `Producto` y `HTTPValidationError`.
+
+Comprobación (2026-11-22): levanté la API en otro puerto y verifiqué que respondiera.
+- `GET /salud` respondió `200 {"estado":"ok"}`.
+- `GET /docs` respondió `200`.
+- `/openapi.json` listó las 5 operaciones de la tabla.
+
+### Pruebas de la API
+`tests/test_api.py` prueba la API con el `TestClient` de FastAPI. Cada prueba crea una base
+temporal con `crear_db.crear()` y la apunta mediante la variable `CAFE_DB`, así que nunca toca
+`data/cafe.db`.
+
+![Ejecución de pruebas](img/pruebas-api.png)
+```text
+> poetry run pytest -q
+.......
+7 passed in 2.48s
+```
+
+| Prueba | Endpoint | Qué comprueba |
+|---|---|---|
+| `test_salud` | `GET /salud` | Responde `{"estado": "ok"}`. |
+| `test_listar_productos` | `GET /productos` | Devuelve los 8 productos de prueba. |
+| `test_filtrar_por_categoria` | `GET /productos?categoria=` | "Pastelería" devuelve solo Croissant y Torta de chocolate. |
+| `test_producto_inexistente` | `GET /productos/{id}` | Un id que no existe devuelve 404. |
+| `test_crear_pedido_calcula_total` | `POST /pedidos` | Responde 201 y calcula el total: 2 × 7.0 + 1 × 6.5 = 20.5. |
+| `test_stock_insuficiente` | `POST /pedidos` | Hay 20 tortas: el primer pedido de 15 se acepta y el segundo de 15 se rechaza con 409. |
+| `test_cantidad_maxima` | `POST /pedidos` | Una cantidad de 21 se rechaza con 422. |
+
+Con esto ya no ocurre el código 5 anotado en la sesión 1 (pytest sin pruebas).
+
+**Pendiente:** `GET /pedidos/{pedido_id}` todavía no tiene prueba, y AGENTS.md pide al menos
+una por endpoint.
