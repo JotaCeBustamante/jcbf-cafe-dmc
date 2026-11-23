@@ -242,3 +242,91 @@ Con esto ya no ocurre el código 5 anotado en la sesión 1 (pytest sin pruebas).
 
 **Pendiente:** `GET /pedidos/{pedido_id}` todavía no tiene prueba, y AGENTS.md pide al menos
 una por endpoint.
+
+### Pantalla Streamlit
+`ui/streamlit_app.py` es la pantalla de CaféDMC. Solo llama a la API por HTTP con `httpx`,
+como pide AGENTS.md: no importa código de `app/` ni abre la base. La dirección de la API se
+toma de la variable `CAFE_API` (por defecto `http://127.0.0.1:8000`). Primero se levanta la
+API y después la pantalla:
+```text
+> poetry run uvicorn app.main:app --reload
+> poetry run streamlit run ui/streamlit_app.py
+  Local URL: http://localhost:8501
+```
+
+![Pantalla Streamlit](img/pantalla-streamlit.png)
+
+Qué muestra la pantalla:
+- **Catálogo:** la tabla con los 8 productos (id, nombre, categoría, precio y stock), que vienen
+  de `GET /productos`. El selector "Categoría" filtra por "Todas" o por una categoría; el filtro
+  se aplica en la pantalla, sin volver a llamar a la API.
+- **Nuevo pedido:** un formulario con ID de cliente, producto y cantidad (de 1 a 20). Al pulsar
+  "Crear pedido" llama a `POST /pedidos`. Si sale bien, muestra el número de pedido y el total
+  en soles; si falla, el código y el mensaje de error que devuelve la API (por ejemplo, 409 por
+  falta de stock).
+- Si la API no responde, la pantalla muestra un aviso y no carga nada más.
+
+**Diferencias con las historias de usuario y con AGENTS.md:**
+- El formulario permite un solo producto por pedido. La historia pide un pedido con varios
+  productos y cantidades; la API ya los acepta, pero la pantalla no.
+- El cliente se elige escribiendo su número de ID, sin mostrar su nombre.
+- La pantalla está en `ui/`, pero AGENTS.md §3 dice que la pantalla va en `app/`. Hay que mover
+  el archivo o corregir AGENTS.md.
+
+### Crear un pedido y descontar stock desde la pantalla
+Desde el formulario "Nuevo pedido" creé un pedido para el cliente 1 con 1 Espresso:
+
+![Pedido creado y stock reducido](img/pedido-stock.png)
+
+- La API respondió **"Pedido #8 creado. Total: S/ 7.00"**. El total es correcto: 1 × 7.00.
+- El stock de Espresso aparece en **97**; antes de usar la pantalla era 100 (ver la captura
+  anterior). Los otros 7 productos no cambiaron.
+- Es el pedido #8 porque los datos de prueba traen 4 pedidos (#1 a #4) y antes de esta captura
+  ya había creado otros desde la pantalla.
+
+Cómo lo hace la API (`app/pedidos.py`, `POST /pedidos`):
+1. Comprueba que el cliente exista y que cada producto exista, esté activo y tenga stock
+   suficiente. Si falta stock, responde 409.
+2. Calcula el total con el precio actual de cada producto.
+3. En una sola transacción inserta el pedido en estado `pendiente`, inserta sus líneas en
+   `detalle_pedido` y descuenta el stock con `UPDATE productos SET stock = stock - ? WHERE id = ?`.
+
+**Observaciones:**
+- **La tabla puede mostrar el stock de antes del pedido.** Streamlit vuelve a ejecutar el script
+  de arriba abajo al enviar el formulario, y lee los productos antes de llamar a
+  `POST /pedidos`. Para ver el stock que dejó este pedido hay que recargar la página.
+- **Riesgo de carrera.** El stock se revisa antes de abrir la transacción, y el `UPDATE` no
+  vuelve a comprobarlo. Si dos pedidos llegan al mismo tiempo, el segundo choca con el
+  `CHECK (stock >= 0)` y termina en un error 500 en lugar de un 409. Para evitarlo, el `UPDATE`
+  debe incluir `AND stock >= ?` y rechazar el pedido si no actualiza ninguna fila.
+- **Los datos de prueba no descuentan stock.** `crear_db.py` inserta los pedidos #1 a #4 sin
+  restarlos del stock; por eso la primera captura mostraba el stock completo.
+
+### Revisión de `app/pedidos.py` y `app/catalogo.py` contra AGENTS.md
+Le pedí al agente revisar los dos módulos y listar como máximo 5 riesgos (seguridad,
+concurrencia y datos), ordenados por gravedad, sin cambiar código. Incluyó `app/modelos.py`
+porque ahí están las validaciones de entrada. Los números de línea corresponden al commit `68aa995`.
+
+| # | Tipo | Riesgo | Dónde |
+|---|---|---|---|
+| 1 | Concurrencia | El stock se revisa **antes** de abrir la transacción y el `UPDATE … SET stock = stock - ?` no lo vuelve a comprobar. Si llegan dos pedidos a la vez, ambos pasan; el segundo choca con `CHECK (stock >= 0)`, el `IntegrityError` no se captura y la API responde **500** en lugar de 409. Si una migración quitara el `CHECK`, el stock quedaría negativo sin que nadie lo note. | `pedidos.py:17-24`, `pedidos.py:35` |
+| 2 | Datos | **Producto repetido en un pedido.** Cada línea se compara contra el stock completo. Un solo pedido con dos líneas de 15 tortas, con stock 20, pasa la revisión, intenta descontar 30 y termina en 500. Se reproduce siempre, con una sola petición. Ni `PedidoNuevo` ni `detalle_pedido` impiden repetir un producto. | `pedidos.py:16-26`, `modelos.py:20` |
+| 3 | Seguridad | **No hay autenticación.** `POST /pedidos` acepta cualquier `cliente_id` y descuenta stock en su nombre. `GET /pedidos/{id}` devuelve el pedido de cualquiera, y los id son consecutivos. Cualquiera puede vaciar el stock con pedidos `pendiente` que nunca se pagan. | `pedidos.py:12`, `pedidos.py:40-43` |
+| 4 | Arquitectura y datos | **Pedidos hace SQL sobre `productos`**, una tabla de Catálogo: la lee y le descuenta stock. AGENTS.md §3 pide que lo haga a través de `catalogo/servicio.py`. Tampoco existen las capas `router` / `servicio` / `repositorio`: las reglas de negocio están en el router. Cualquier regla que Catálogo agregue sobre el stock se salta. | `pedidos.py:12-35` |
+| 5 | Datos | **El dinero se maneja como `float`.** El total se acumula en `float` (`0.1 * 3 = 0.30000000000000004`) y se redondea al final. `total` se guarda en la tabla y nada lo vuelve a calcular desde `detalle_pedido`, así que puede quedar desalineado con sus líneas. | `pedidos.py:14`, `pedidos.py:25`, `pedidos.py:29`, `modelos.py:9`, `modelos.py:27` |
+
+**Qué cumple:** todo el SQL va parametrizado con `?`. En `catalogo.py:19` y `catalogo.py:27`,
+`SQL_BASE +` solo concatena texto fijo: el valor de la categoría y el id van como parámetros.
+`catalogo.py` solo toca sus propias tablas.
+
+**Fuera del límite de 5:** `GET /pedidos/{pedido_id}` no tiene prueba, y AGENTS.md pide al
+menos una por endpoint.
+
+**Cómo corregirlos (pendiente, no se cambió código):**
+- **1 y 2:** juntar los productos repetidos en una sola línea antes de validar. Dentro de la
+  transacción, descontar con `UPDATE … SET stock = stock - ? WHERE id = ? AND stock >= ?` y
+  responder 409 si no se actualizó ninguna fila.
+- **4:** separar `app/catalogo/` y `app/pedidos/` en `router.py`, `schemas.py`, `servicio.py` y
+  `repositorio.py`, y que el descuento de stock pase por `catalogo/servicio.py`.
+- **5:** usar `Decimal` (o céntimos enteros) para calcular el total.
+- **3:** se resuelve con autenticación, que está fuera del alcance actual.
