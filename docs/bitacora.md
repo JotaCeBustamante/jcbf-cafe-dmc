@@ -48,7 +48,9 @@ ejercicio 1.4, el nivel 3 (componentes de la API).
   sesión 2, al escribir las primeras pruebas de la API.
 
 ### Qué corregí de lo que propuso el agente
-- _(Completar: qué cambiaste tú en AGENTS.md, ADR-0001 o los diagramas que propuso el agente.)_
+- **Glosario de `AGENTS.md` (ejercicio 1.1):** corregí el glosario que propuso el agente antes
+  de dejarlo en el repositorio. La versión final define pedido, ítem, stock, cliente y estado
+  del pedido, con los estados `pendiente`, `pagado`, `entregado` y `anulado` y el flujo entre ellos.
 
 ### Ejercicio 1.1 · Glosario en AGENTS.md
 Hecho: sección **Glosario** en `AGENTS.md` con pedido, ítem, stock, cliente y estado del pedido
