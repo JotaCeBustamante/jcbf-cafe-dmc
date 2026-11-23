@@ -1,0 +1,8 @@
+# Hooks que corren antes de cada commit.
+# Instalar una vez por clon: poetry run pre-commit install
+# Mantener `rev` igual a la versión de ruff en poetry.lock.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.5
+    hooks:
+      - id: ruff-check
