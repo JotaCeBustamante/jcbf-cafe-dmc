@@ -14,6 +14,10 @@ class Producto(BaseModel):
     stock: int
 
 
+class CambioStock(BaseModel):
+    cantidad: int = Field(gt=0)
+
+
 class Cliente(BaseModel):
     id: int
     nombre: str

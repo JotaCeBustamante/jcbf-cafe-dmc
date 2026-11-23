@@ -790,3 +790,166 @@ Estas pruebas también sirven a futuro: si una migración borra o renombra un í
 - **Con tablas tan pequeñas no se nota en el tiempo.** Con 13 pedidos un `SCAN` es instantáneo.
   Lo que importa es el plan: con el índice, el costo de la consulta ya no crece con el total de
   pedidos, sino con los que tienen ese estado.
+
+## Catálogo como servicio independiente · 2026-11-22
+
+### Decisión
+Le pedí al agente ejecutar el catálogo como servicio propio en el puerto 8001 y que pedidos
+obtenga precio y stock por HTTP en lugar de leer la tabla.
+
+El agente se detuvo antes de cambiar código. Avisó que el pedido va contra ADR-0002 (aceptado):
+ese ADR descartó separar en servicios porque el pedido y su efecto en el stock dejan de estar
+en la misma transacción. También advirtió que pedidos no solo **lee** `productos`: además
+**descuenta** stock con `UPDATE productos`. Me hizo tres preguntas, y elegí:
+
+| Pregunta | Mi respuesta |
+|---|---|
+| ¿Cómo se descuenta el stock? | Por HTTP con compensación: el catálogo expone `descontar` (atómico) y `devolver`; pedidos deja de tocar la tabla. Descarté "solo lectura por HTTP y `UPDATE` directo", porque la separación sería aparente. |
+| ¿El puerto 8000 sigue sirviendo `/productos`? | No: el catálogo vive solo en 8001. |
+| ¿Se registra en un ADR? | Sí, pero con un commit antes de los cambios para poder revertirlos: `5aa8935`. |
+
+Quedó registrada en [ADR-0003](adr/0003-separar-catalogo-como-servicio.md), que reemplaza en
+parte a ADR-0002. No responde a una de las condiciones de revisión de ADR-0002 (escalar,
+otro equipo, PostgreSQL): es un ejercicio del paso 2 de su "camino de evolución", exponer la
+API interna de un módulo por HTTP.
+
+### Qué cambió
+| Antes | Después |
+|---|---|
+| Un proceso (`app.main`, :8000) con catálogo, pedidos y clientes | Dos procesos: catálogo (`app.catalogo_main`, :8001) y pedidos y clientes (`app.main`, :8000) |
+| Pedidos lee `productos` con SQL | Pedidos llama `GET /productos/{id}` con `app/catalogo_cliente.py` |
+| Pedidos descuenta con `UPDATE productos …` en la transacción del pedido | Pedidos llama `POST /productos/{id}/descontar`, atómico (`… AND stock >= ?`), y compensa con `POST /productos/{id}/devolver` si algo falla |
+| Pedido y stock: una transacción, todo o nada | Sin transacción común: descuento por HTTP y compensación |
+| — | Catálogo caído → `POST /pedidos` responde **503** sin crear el pedido |
+| Producto repetido en un pedido → **500** | → **409**, y el stock vuelve a su valor |
+| La pantalla lee productos de :8000 | La pantalla lee productos de :8001 (`CAFE_CATALOGO_API`) |
+
+Se mantuvo una sola SQLite para los dos servicios: mover el catálogo a una base propia (paso 3
+de ADR-0002) queda pospuesto, y `detalle_pedido.producto_id` sigue con clave foránea a `productos`.
+
+### Pruebas
+Primero se escribieron 13 pruebas nuevas. Al correrlas fallaba la carga del archivo, porque
+`app.catalogo_main` y `app.catalogo_cliente` aún no existían. En las pruebas, pedidos le habla
+al catálogo por HTTP en memoria (`TestClient`), reemplazando la dependencia `get_catalogo`.
+
+| Prueba | Qué comprueba |
+|---|---|
+| `test_descontar_stock` / `test_devolver_stock` | El stock baja y sube en el catálogo. |
+| `test_descontar_mas_que_el_stock` | 409 y el stock no cambia. |
+| `test_descontar_producto_inexistente` / `test_devolver_producto_inexistente` | 404. |
+| `test_descontar_cantidad_invalida` | Cantidad 0 → 422. |
+| `test_api_de_pedidos_ya_no_sirve_productos` | `GET /productos` en :8000 → 404. |
+| `test_crear_pedido_descuenta_stock_en_catalogo` | Un pedido de 2 Espressos deja el stock en 98. |
+| `test_producto_inexistente_en_pedido` | Producto 99 → 404 `"Producto 99 no existe"`. |
+| `test_producto_repetido_compensa_stock` | Torta 15 + 15 con stock 20 → 409, stock en 20, sin pedido nuevo. |
+| `test_catalogo_caido_responde_503` | Con el catálogo caído → 503, sin pedido nuevo. |
+| `test_pedidos_no_hace_sql_sobre_tablas_del_catalogo` | `app/pedidos.py` no contiene SQL sobre `productos` ni `categorias`. |
+
+```text
+> poetry run pytest -q
+42 passed
+> poetry run ruff check .
+All checks passed!
+```
+
+**Verificación con dos procesos reales.** El agente levantó los dos `uvicorn` en los puertos de
+prueba 8765 y 8766, sobre una base temporal, para no chocar con mis servidores:
+
+| Paso | Resultado |
+|---|---|
+| `GET /productos/1` en el catálogo | Stock del Espresso: 100 |
+| `GET /productos` en la API de pedidos | 404 |
+| `POST /pedidos` con 2 Espressos | 201; en el log del catálogo: `GET /productos/1` y `POST /productos/1/descontar` |
+| `GET /productos/1` en el catálogo | Stock: 98 |
+| `POST /pedidos` con torta 15 + 15 | 409; en el log: `descontar` 200, `descontar` 409, `devolver` 200 |
+| `GET /productos/8` en el catálogo | Stock: 20 (compensado) |
+| `POST /pedidos` con el catálogo apagado | 503, y la lista de pedidos de Ana no cambió |
+
+En el primer intento con el catálogo apagado, la API respondió 201: `Stop-Process` cerró el
+proceso `poetry.exe`, pero el `uvicorn` que lanzó siguió corriendo. El agente cerró solo lo que
+escuchaba en los puertos de prueba (`Get-NetTCPConnection`) y repitió el paso. Antes, el
+sistema de permisos le había bloqueado un comando que cerraba **todos** los `uvicorn`, porque
+también habría cerrado los míos.
+
+### Riesgos que trae la decisión
+- **Sin transacción común.** Si la API se cae entre el descuento y el guardado, o si la
+  compensación falla, el stock queda descontado sin pedido. La falla de compensación solo queda
+  en el log.
+- **`descontar` y `devolver` no tienen autenticación:** cualquiera que llegue a :8001 cambia el stock.
+- **Catálogo caído = no se pueden crear pedidos,** y la pantalla no muestra productos.
+- **Dos procesos que levantar** en vez de uno, y pruebas más complejas.
+
+### AGENTS.md y diagramas
+- **AGENTS.md** tiene una sección nueva, **§3 "Levantar el sistema"**: crear la base, catálogo,
+  API y pantalla, en orden y cada uno en su terminal, más cómo comprobar que responden y las
+  variables opcionales. Las secciones siguientes pasaron a ser §4 Arquitectura, §5 Reglas y
+  §6 Glosario. Las referencias a "AGENTS.md §3" de entradas anteriores de esta bitácora se
+  refieren a la numeración de ese momento (Arquitectura). También se corrigió que la pantalla
+  está en `ui/`, y se quitó la sección "Pendiente" de AGENTS.md.
+- **`docs/arquitectura.md`**: el C4 nivel 2 muestra los dos servicios y quién hace SQL sobre qué
+  tablas; el nivel 3 lleva una nota de que es el diseño objetivo y aún no refleja el código; y
+  hay una sección nueva, **§4 Modelo de datos**, con el diagrama ER de `db/schema.sql`, el dueño
+  y los índices de cada tabla.
+
+**Pregunta de control al agente.** Le pregunté a un agente nuevo, sin el contexto de esta
+conversación: "¿Cómo levanto el sistema completo en mi laptop? Dame los comandos exactos, en
+orden." Respondió con los comandos de AGENTS.md §3, citando la sección en cada paso:
+```text
+poetry install
+poetry run python scripts/crear_db.py            (--reset para empezar de cero)
+poetry run uvicorn app.catalogo_main:app --port 8001 --reload
+poetry run uvicorn app.main:app --port 8000 --reload
+poetry run streamlit run ui/streamlit_app.py
+```
+Agregó, por su cuenta, dos avisos útiles:
+- Esos comandos todavía no estaban en un commit: quien clonara el repo en ese momento vería la
+  versión anterior. Se resolvió con el commit de esta entrada.
+- AGENTS.md §4 describe carpetas `app/catalogo/` con `router.py`, `servicio.py`, etc., pero el
+  código usa archivos sueltos. No afecta el arranque; queda en pendientes.
+
+## Estado de los pendientes · 2026-11-22
+Revisión de todo lo que quedó anotado como pendiente u observación en esta bitácora.
+
+**Resueltos**
+
+| Pendiente | Dónde se anotó | Cómo se resolvió |
+|---|---|---|
+| `GET /pedidos/{pedido_id}` sin prueba | Pruebas de la API | Las pruebas del PATCH de estado lo usan para comprobar cada cambio. |
+| La pantalla está en `ui/`, AGENTS.md decía `app/` | Pantalla Streamlit | AGENTS.md corregido. |
+| Riesgo 1: carrera en el descuento de stock → 500 | Revisión de `pedidos.py` | `descontar` es atómico en el catálogo (`… AND stock >= ?`). |
+| Riesgo 2: producto repetido en un pedido → 500 | Revisión de `pedidos.py` | Da 409 y se compensa el stock (`test_producto_repetido_compensa_stock`). |
+| Riesgo 4: pedidos hace SQL sobre `productos` | Revisión de `pedidos.py` | Usa el catálogo por HTTP; una prueba lo vigila. |
+| Prueba del 404 de `POST /pedidos` con producto inexistente | Caso 404 | `test_producto_inexistente_en_pedido`. |
+| Diagramas C4 desactualizados; falta diagrama ER | ADR-0003 y checklist | `docs/arquitectura.md` actualizado. |
+| Comandos para levantar el sistema en AGENTS.md | AGENTS.md "Pendiente" | AGENTS.md §3. |
+
+**Abiertos**
+
+| Pendiente | Dónde se anotó |
+|---|---|
+| Agregar `%APPDATA%\Python\Scripts` al PATH: el agente sigue llamando a Poetry por su ruta completa | Sesión 1 |
+| `clientes` tiene dos módulos que hacen SQL sobre ella (`clientes.py` y `pedidos.py`); falta un solo dueño | Endpoint de clientes |
+| AGENTS.md §4 y el C4 nivel 3 describen `router.py`/`servicio.py`/`repositorio.py`, pero el código usa archivos sueltos con las reglas en el router | Varias entradas |
+| Swagger no documenta los 404, 409 ni el nuevo 503; el ejemplo del PATCH es `"pendiente"` y `estado` aparece como `"string"` | Casos 404/409, PATCH |
+| Prueba de `POST /pedidos` con cliente inexistente, y de cantidad 0 (límite inferior) | Casos 404 y 422 |
+| Anular un pedido no devuelve stock (ahora se haría con `POST /productos/{id}/devolver`) | PATCH de estado |
+| Dinero en `float` en vez de `Decimal` o céntimos | Riesgo 5 |
+| Sin autenticación; ahora también `descontar` y `devolver` en :8001 | Riesgo 3, ADR-0003 |
+| Pedidos duplicados por clics repetidos; `descontar` y `devolver` no son idempotentes | Mis pedidos, ADR-0003 |
+| La pantalla permite un solo producto por pedido y muestra el stock de antes del pedido | Pantalla Streamlit |
+| Fechas en UTC sin formato en "Mis pedidos" | Mis pedidos |
+| `data/cafe.db` sin `idx_pedidos_estado`: correr `poetry run python scripts/crear_db.py` | Planes de consulta |
+| Falta la captura del caso 422 | Caso 422 |
+| **Probar la pantalla con los dos servicios corriendo** (crear un pedido y ver "Mis pedidos") | Esta entrada |
+
+## Checklist de la sesión 2
+
+| Ítem | Estado |
+|---|---|
+| `db/schema.sql` y `data/cafe.db` (esta última fuera de git) | ✅ `data/*.db` está en `.gitignore`; `git ls-files data/` no lista nada. |
+| API con catálogo y pedidos; `/docs` funciona | ✅ Dos servicios desde ADR-0003, con `/docs` en :8001 y en :8000. Verificado con `uvicorn` real en puertos de prueba. |
+| `poetry run pytest -q` en verde | ✅ 42 pasan. |
+| Pantalla Streamlit creando pedidos | ⚠️ Comprobado antes de la separación (pedido #8 y "Mis pedidos"). Con dos servicios falta repetir la prueba en la pantalla. |
+| Diagrama ER en `docs/arquitectura.md` | ✅ §4 Modelo de datos. |
+| AGENTS.md actualizado con los comandos nuevos | ✅ §3 Levantar el sistema; un agente nuevo respondió con esos comandos. |
+| Bitácora y commit | ✅ Esta entrada y el commit que la acompaña. |

@@ -1,10 +1,9 @@
-"""API de CaféDMC: monolito modular con dos contextos (catálogo y pedidos)."""
+"""API de pedidos y clientes de CaféDMC, puerto 8000. El catálogo es otro servicio (ADR-0003)."""
 from fastapi import FastAPI
 
-from app import catalogo, clientes, pedidos
+from app import clientes, pedidos
 
 app = FastAPI(title="CaféDMC API", version="0.1.0")
-app.include_router(catalogo.router)
 app.include_router(pedidos.router)
 app.include_router(clientes.router)
 

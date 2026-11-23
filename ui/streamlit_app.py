@@ -4,15 +4,16 @@ import os
 import httpx
 import streamlit as st
 
-API = os.environ.get("CAFE_API", "http://127.0.0.1:8000")
+API = os.environ.get("CAFE_API", "http://127.0.0.1:8000")  # pedidos y clientes
+CATALOGO = os.environ.get("CAFE_CATALOGO_API", "http://127.0.0.1:8001")  # productos (ADR-0003)
 
 st.set_page_config(page_title="CaféDMC", page_icon="☕")
 st.title("☕ CaféDMC")
 
 try:
-    productos = httpx.get(f"{API}/productos", timeout=5).json()
+    productos = httpx.get(f"{CATALOGO}/productos", timeout=5).json()
 except httpx.HTTPError:
-    st.error(f"No se pudo conectar con la API en {API}. ¿Está corriendo uvicorn?")
+    st.error(f"No se pudo conectar con el catálogo en {CATALOGO}. ¿Está corriendo en el puerto 8001?")
     st.stop()
 
 categorias = sorted({p["categoria"] for p in productos})

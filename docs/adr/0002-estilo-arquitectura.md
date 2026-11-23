@@ -1,6 +1,6 @@
 # ADR-0002: Empezar CaféDMC como monolito modular
 
-- **Estado:** Aceptado
+- **Estado:** Aceptado; reemplazado en parte por [ADR-0003](0003-separar-catalogo-como-servicio.md) (el catálogo como servicio)
 - **Fecha:** 2026-11-16
 - **Relacionado:** [ADR-0001](0001-stack.md) (stack), [arquitectura.md](../arquitectura.md) (C4 nivel 2)
 
