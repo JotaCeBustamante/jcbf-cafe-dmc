@@ -86,3 +86,8 @@ El catálogo corre como servicio propio ([ADR-0003](docs/adr/0003-separar-catalo
   - `anulado` — cancelado antes de la entrega. Estado final.
 
   Flujo: `pendiente` → `pagado` → `entregado`; `pendiente` o `pagado` → `anulado`.
+
+## Herramientas MCP
+- cafe-archivos: lee archivos del proyecto (solo lectura, sin .env/.git/data).
+- Probar sin agente: `poetry run python scripts/probar_mcp.py mcp_servers/fs_server.py`
+- Regenerar configuración: `poetry run python scripts/configurar_mcp.py`

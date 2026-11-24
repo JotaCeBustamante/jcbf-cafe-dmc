@@ -953,3 +953,234 @@ Revisión de todo lo que quedó anotado como pendiente u observación en esta bi
 | Diagrama ER en `docs/arquitectura.md` | ✅ §4 Modelo de datos. |
 | AGENTS.md actualizado con los comandos nuevos | ✅ §3 Levantar el sistema; un agente nuevo respondió con esos comandos. |
 | Bitácora y commit | ✅ Esta entrada y el commit que la acompaña. |
+
+## Instalación del SDK de MCP · 2026-11-23
+
+### Qué se instaló
+El SDK oficial de Python para MCP (Model Context Protocol), con el extra `cli`, que trae la
+herramienta de línea de comandos `mcp` para probar servidores. Se agregó con Poetry, como pide
+AGENTS.md §5, sin editar `pyproject.toml` a mano:
+```text
+> poetry add "mcp[cli]>=2.3,<3"
+Package operations: 8 installs, 0 updates, 0 removals
+  - Installing pycparser (3.12)
+  - Installing cffi (2.1.1)
+  - Installing cryptography (50.0.2)
+  - Installing mcp-types (2.3.0)
+  - Installing pyjwt (2.15.1)
+  - Installing pywin32 (312)
+  - Installing sse-starlette (3.7.1)
+  - Installing mcp (2.3.0)
+Writing lock file
+```
+
+![Instalación del SDK de MCP](img/mcp-instalacion.png)
+
+- **Versión instalada:** `mcp` 2.3.0. La restricción `>=2.3,<3` acepta cualquier 2.x desde la
+  2.3, pero no una 3.0, que podría traer cambios incompatibles.
+- **Dependencia de producción**, no del grupo dev: los servidores MCP son código que se ejecuta,
+  no una herramienta de desarrollo.
+- **Cambios en el repo:** `pyproject.toml` suma `"mcp[cli] (>=2.3,<3)"` en `dependencies`, y
+  `poetry.lock` fija las 8 versiones nuevas.
+- Las otras dependencias de `mcp` (por ejemplo `httpx`, `pydantic`, `starlette`, `uvicorn`) ya
+  estaban instaladas por FastAPI, así que no se agregaron.
+- `pywin32` aparece porque el equipo es Windows; en Linux o macOS no se instala.
+
+### Comprobación
+```text
+> poetry run python -c "from mcp.server import MCPServer; print('SDK MCP listo')"
+SDK MCP listo
+```
+El import funciona dentro del `.venv` del proyecto, así que el SDK quedó disponible para los
+servidores de `mcp_servers/`.
+
+## Configuración de los servidores MCP · 2026-11-23
+
+### Qué hace `scripts/configurar_mcp.py`
+Escribe, de una sola vez, la configuración MCP del proyecto para cuatro agentes. Registra cada
+servidor de `mcp_servers/` que ya exista; los que todavía no existen se omiten:
+
+| Servidor | Archivo | Estado |
+|---|---|---|
+| `cafe-archivos` | `mcp_servers/fs_server.py` | ✅ Existe: se registró |
+| `cafe-db` | `mcp_servers/db_server.py` | Aún no existe |
+| `cafe-contexto` | `mcp_servers/rag_server.py` | Aún no existe |
+
+Cada servidor se lanza con **rutas absolutas** al Python del `.venv` y al archivo del servidor.
+Así el agente no necesita tener `poetry` en su PATH, que es justo el problema anotado desde la
+sesión 1.
+
+```text
+> poetry run python scripts/configurar_mcp.py
+✅ Configuración escrita para: cafe-archivos
+   Claude Code  → .mcp.json
+   Antigravity  → .agents/mcp_config.json
+   Codex        → .codex/config.toml
+   Gemini CLI   → .gemini/settings.json
+   Python del entorno: C:\Users\JoseBustamante\jcbf-cafe-dmc\.venv\Scripts\python.exe
+```
+
+![Configuración MCP](img/mcp-configuracion.png)
+
+### Archivos generados
+| Agente | Archivo | Formato |
+|---|---|---|
+| Claude Code | `.mcp.json` | JSON, `mcpServers` (alcance de proyecto) |
+| Antigravity (IDE, app y CLI `agy`) | `.agents/mcp_config.json` | JSON, `mcpServers` |
+| Codex | `.codex/config.toml` | TOML, `[mcp_servers.cafe-archivos]` con `startup_timeout_sec = 30` |
+| Gemini CLI | `.gemini/settings.json` | JSON, `mcpServers` y `context.fileName = ["AGENTS.md"]` |
+
+El bloque de `cafe-archivos` es el mismo en los cuatro:
+```json
+"cafe-archivos": {
+  "command": "C:\Users\JoseBustamante\jcbf-cafe-dmc\.venv\Scripts\python.exe",
+  "args": ["C:\Users\JoseBustamante\jcbf-cafe-dmc\mcp_servers\fs_server.py"]
+}
+```
+
+### Observaciones
+- **Los cuatro archivos están en `.gitignore`** (`.mcp.json`, `.agents/mcp_config.json`,
+  `.codex/` y `.gemini/`). Es lo correcto: tienen rutas absolutas de esta laptop y no sirven en
+  otra. Quien clone el repo debe correr `poetry install` y después `scripts/configurar_mcp.py`;
+  lo que se versiona es el script.
+- **Hay que volver a correr el script** cada vez que se agregue un servidor a `mcp_servers/`
+  (por ejemplo `db_server.py`), o si se borra y se vuelve a crear el `.venv` en otra ruta.
+- **Codex solo carga `.codex/config.toml` si el proyecto está marcado como "trusted".**
+- **Gemini CLI** lee además `AGENTS.md` como contexto gracias a `context.fileName`;
+  Antigravity lo lee por su cuenta.
+- **Los agentes cargan la configuración al iniciar.** Claude Code, por ejemplo, pide aprobar
+  los servidores de un `.mcp.json` de proyecto la primera vez; hay que reiniciar la sesión del
+  agente para que vea `cafe-archivos`.
+
+## Uso del servidor MCP `cafe-archivos` · 2026-11-23
+
+### Aprobación
+`claude mcp list` mostró `cafe-archivos` como **"Pending approval"**: Claude Code no usa los
+servidores de un `.mcp.json` de proyecto hasta que alguien los aprueba. Lo aprobé al abrir
+`claude` en la raíz del proyecto. `claude` no está en el PATH; se usa el `claude.exe` que trae
+la extensión de VS Code.
+
+### Prueba desde el agente
+Le pedí al agente, en una sesión nueva de Claude Code:
+"Usa la herramienta cafe-archivos para listar docs/adr y resume la ADR-0001 en 3 viñetas.
+Luego intenta leer el archivo .env y dime qué pasó."
+
+![El agente usa cafe-archivos](img/mcp-uso-agente.png)
+
+El agente llamó a `cafe-archivos` 3 veces ("Called cafe-archivos 3 times"):
+
+| # | Herramienta | Resultado |
+|---|---|---|
+| 1 | `listar_archivos("docs/adr")` | `0001-stack.md`, `0002-estilo-arquitectura.md`, `0003-separar-catalogo-como-servicio.md` y `README.md` |
+| 2 | `leer_archivo("docs/adr/0001-stack.md")` | El contenido de la ADR, que resumió en 3 viñetas: decisión, ventajas, y costos y alternativas |
+| 3 | `leer_archivo(".env")` | Error: `Acceso denegado: '.env' es una carpeta o archivo protegido` |
+
+Resumen de ADR-0001 que dio el agente (stack tecnológico, estado **Propuesto**, 2026-11-16):
+- **Decisión:** Python 3.11+, Poetry sin paquete, FastAPI + Pydantic, SQLite, Streamlit, pytest
+  y ruff, porque el equipo sabe Python, cada alumno lo corre en su laptop sin Docker y los
+  agentes de IA deben poder leer, probar y modificar el sistema.
+- **Ventajas:** se instala con `poetry install` y se comprueba con pytest y ruff, sin servidor
+  de base de datos; tipos explícitos y OpenAPI generado por FastAPI.
+- **Costos y alternativas:** SQLite admite una sola escritura a la vez, el SQL y las migraciones
+  se escriben a mano y Streamlit limita la interfaz. Se descartaron Django y PostgreSQL; este
+  último se volverá a evaluar si el sistema pasa a producción.
+
+Antes de intentar leer `.env`, el agente revisó el servidor y confirmó que el archivo está
+bloqueado, así que la prueba no podía exponer nada.
+
+### Por qué se bloqueó `.env`
+En `mcp_servers/fs_server.py`, `_ruta_segura()` revisa cada ruta **antes** de abrir el archivo:
+1. Resuelve la ruta y rechaza todo lo que quede fuera de la raíz del proyecto (`../`, rutas
+   absolutas).
+2. Rechaza la ruta si alguna de sus partes está en
+   `BLOQUEADOS = {".env", ".git", ".venv", "data", ".chroma", "logs", "__pycache__"}`.
+
+La herramienta responde un error (`is_error = True`) en vez del contenido. `listar_archivos`
+tampoco muestra esos nombres. Así se cumple AGENTS.md §5 ("No leas, abras ni muestres `.env`
+ni nada dentro de `data/`") aunque el agente lo pida.
+
+**Prueba sin agente.** Repetí las tres llamadas con el cliente de prueba, que arranca el
+servidor por stdio, y dieron el mismo resultado:
+```text
+> poetry run python scripts/probar_mcp.py mcp_servers/fs_server.py leer_archivo ruta=.env
+Herramientas: ['listar_archivos', 'leer_archivo']
+¿Error?: True
+Error executing tool leer_archivo: Acceso denegado: '.env' es una carpeta o archivo protegido
+```
+
+### Observaciones
+- **El bloqueo es por nombre exacto.** `.env.local` o `.env.production` no están en
+  `BLOQUEADOS` y se podrían leer. Si alguna vez existen, conviene bloquear todo lo que empiece
+  por `.env`.
+- **ADR-0001 sigue en estado "Propuesto"**, aunque el stack ya está en uso; debería pasar a
+  "Aceptado".
+- **El servidor no tiene pruebas automáticas** en `tests/`. Las de esta entrada se hicieron a
+  mano; convendría una prueba que llame a `leer_archivo(".env")` y a `leer_archivo("../x")` y
+  exija el error.
+
+## MCP remoto por HTTP · 2026-11-23
+
+### Local (stdio) vs. remoto (HTTP)
+`mcp_servers/fs_server.py` puede correr de dos formas, con las mismas herramientas:
+
+| Modo | Cómo se levanta | Quién lo arranca | Cómo se habla con él |
+|---|---|---|---|
+| Local (stdio) | `poetry run python mcp_servers/fs_server.py` | El agente o el cliente, como proceso hijo | Por la entrada y salida estándar del proceso |
+| Remoto (HTTP) | `poetry run python mcp_servers/fs_server.py --http` | Yo, en su propia terminal; queda corriendo | Por HTTP en `http://127.0.0.1:8765/mcp` (transporte *streamable HTTP*) |
+
+Con HTTP, el servidor es un proceso independiente: varios clientes pueden conectarse a la misma
+dirección, y el cliente no necesita saber qué Python ni qué archivo lo ejecuta.
+
+### Prueba
+Levanté el servidor en una terminal:
+```text
+> poetry run python mcp_servers/fs_server.py --http
+INFO:     Started server process [81532]
+INFO:     Waiting for application startup.
+INFO:mcp.server.streamable_http_manager:StreamableHTTP session manager started
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8765 (Press CTRL+C to quit)
+INFO:     127.0.0.1:60526 - "POST /mcp HTTP/1.1" 200 OK
+INFO:     127.0.0.1:60526 - "POST /mcp HTTP/1.1" 200 OK
+INFO:fs_server:leer_archivo AGENTS.md
+INFO:     127.0.0.1:60526 - "POST /mcp HTTP/1.1" 200 OK
+```
+
+![Servidor MCP por HTTP](img/mcp-http.png)
+
+En otra terminal, el cliente de prueba se conectó por la URL en vez de arrancar el servidor:
+```text
+> poetry run python scripts/probar_mcp.py http://127.0.0.1:8765/mcp leer_archivo ruta=AGENTS.md
+Herramientas: ['listar_archivos', 'leer_archivo']
+¿Error?: False
+# AGENTS.md — CaféDMC
+...
+```
+
+Cómo leer el log del servidor:
+- Corre sobre **uvicorn**, el mismo servidor web de las APIs de CaféDMC, en el puerto **8765**
+  y solo en `127.0.0.1`: no acepta conexiones desde otras máquinas.
+- Todo el protocolo va por **`POST /mcp`**: cada mensaje MCP (iniciar la sesión, listar
+  herramientas, llamar a una) es una petición HTTP a la misma ruta. Las tres peticiones salen
+  del mismo puerto del cliente (`60526`), es decir, de una sola conexión.
+- `INFO:fs_server:leer_archivo AGENTS.md` es el log de la propia herramienta. Va a la salida de
+  errores; en modo stdio eso es obligatorio, porque la salida estándar es el canal del protocolo.
+
+El bloqueo de `.env` funciona igual por HTTP, porque está en la herramienta y no en el transporte:
+```text
+> poetry run python scripts/probar_mcp.py http://127.0.0.1:8765/mcp leer_archivo ruta=.env
+¿Error?: True
+Error executing tool leer_archivo: Acceso denegado: '.env' es una carpeta o archivo protegido
+```
+
+### Observaciones
+- **No tiene autenticación.** Cualquier proceso de esta laptop que llegue a `127.0.0.1:8765`
+  puede leer los archivos del proyecto, salvo los bloqueados. Escucha solo en `127.0.0.1`, pero
+  para exponerlo en la red habría que agregar un token u OAuth y HTTPS.
+- **Choca con el puerto de prueba de ADR-0003.** En la verificación con dos procesos reales, el
+  agente usó 8765 y 8766 para el catálogo y la API. Si el servidor MCP está corriendo, esa
+  verificación falla al levantar el catálogo.
+- **Los agentes no lo usan todavía.** `.mcp.json` y los demás archivos de
+  `scripts/configurar_mcp.py` registran solo el modo stdio. Para que Claude Code use el modo
+  HTTP habría que registrarlo con `"type": "http"` y `"url": "http://127.0.0.1:8765/mcp"`, y
+  dejar el servidor corriendo.
